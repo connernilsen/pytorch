@@ -132,8 +132,8 @@ def math_attention(
     working_precision = torch.float64 if query.dtype == torch.float64 else torch.float32
 
     is_gqa = query.dim() > 4
+    og_q_shape = query.shape
     if is_gqa:  # in case of gqa
-        og_q_shape = query.shape
         query = torch.flatten(query, start_dim=-3, end_dim=-2)
 
     scores = (query @ key.transpose(-2, -1)).to(dtype=working_precision)
@@ -556,11 +556,11 @@ def sdpa_dense_backward(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     working_precision = torch.float64 if query.dtype == torch.float64 else torch.float32
     is_gqa = query.dim() > 4
+    og_q_shape = query.shape
     if is_gqa:  # in case of gqa
-        og_q_shape = query.shape
         query = torch.flatten(query, start_dim=-3, end_dim=-2)
         out = torch.flatten(out, start_dim=-3, end_dim=-2)
-        logsumexp= torch.flatten(logsumexp, start_dim=-2, end_dim=-1)
+        logsumexp = torch.flatten(logsumexp, start_dim=-2, end_dim=-1)
         grad_out = torch.flatten(grad_out, start_dim=-3, end_dim=-2)
     scores = (query @ key.transpose(-2, -1)).to(working_precision)
 

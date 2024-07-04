@@ -231,65 +231,73 @@ def _create_block_mask_from_mask(
 def _create_mask(
     score_mod: _score_mod_signature,
     B: int,
-    H: int,
+    Hkv: int,
     M: int,
     N: int,
     device: str = "cuda",
+    G: int = 1,
 ):
     r"""This function creates a mask tensor from a score_mod function.
 
     Args:
         score_mod (Callable): Function to modify attention scores.
         B (int): Batch size.
-        H (int): Number of heads.
+        Hkv (int): Number of KV heads.
         M (int): Sequence length of query.
         N (int): Sequence length of key/value.
         device (str): Device to run the mask creation on.
+        G (int): Hq // Hkv. In case of GQA, the number of query heads that share the same kv head.
 
     Returns:
-        mask (Tensor): A mask tensor with shape (B, H, M, N).
+        mask (Tensor): A mask tensor with shape (B, Hkv, M * G, N).
     """
     b = torch.arange(0, B, device=device)
-    h = torch.arange(0, H, device=device)
+    hkv = torch.arange(0, Hkv, device=device)
+    g = torch.arange(0, G, device=device)
+    hq = hkv[:, None] * G + g[None, :]
     m = torch.arange(0, M, device=device)
     n = torch.arange(0, N, device=device)
     score_mod = torch.vmap(score_mod, in_dims=(0, None, None, None, 0))
     score_mod = torch.vmap(score_mod, in_dims=(0, None, None, 0, None))
     score_mod = torch.vmap(score_mod, in_dims=(0, None, 0, None, None))
+    score_mod = torch.vmap(score_mod, in_dims=(0, None, 0, None, None))
     score_mod = torch.vmap(score_mod, in_dims=(0, 0, None, None, None))
     with TransformGetItemToIndex():
-        out = score_mod(torch.zeros(B, H, M, N, device=device), b, h, m, n)
+        out = score_mod(torch.zeros(B, Hkv, G, M, N, device=device), b, hq, m, n)
     mask = torch.where(torch.isinf(out), False, True)
-    return mask
+    return torch.flatten(mask, start_dim=-3, end_dim=-2)
 
 
 def _create_block_mask(
     score_mod: _score_mod_signature,
     B: int,
-    H: int,
+    Hkv: int,
     M: int,
     N: int,
     device: str = "cuda",
     KV_BLOCK_SIZE: int = _DEFAULT_SPARSE_BLOCK_SIZE,
     Q_BLOCK_SIZE: int = _DEFAULT_SPARSE_BLOCK_SIZE,
+    G: int = 1,
 ):
     r"""This function creates a block mask tuple from a score_mod function.
 
     Args:
         score_mod (Callable): Function to modify attention scores.
         B (int): Batch size.
-        H (int): Number of heads.
+        Hkv (int): Number of KV heads.
         M (int): Sequence length of query.
         N (int): Sequence length of key/value.
         device (str): Device to run the mask creation on.
         KV_BLOCK_SIZE (int): Block size of block mask for each query.
         Q_BLOCK_SIZE (int): Block size of block mask for each key/value.
+        G (int): In case of GQA, the number of query heads that share the same kv head.
 
     Returns:
         block_mask (tuple): A tuple of (kv_num_blocks, kv_indices, q_num_blocks, q_indices,
                             KV_BLOCK_SIZE, Q_BLOCK_SIZE) which represents the block mask.
     """
-    mask = _create_mask(score_mod, B, H, M, N, device)
+    mask = _create_mask(score_mod, B, Hkv, M, N, device, G)
+    print("mask", mask.shape)
     block_mask = _create_block_mask_from_mask(mask, KV_BLOCK_SIZE, Q_BLOCK_SIZE)
     return block_mask
 

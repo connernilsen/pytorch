@@ -56,7 +56,13 @@ def create_attention(score_mod, block_mask, is_gqa):
 
 def create_block_mask(score_mod, query, key):
     block_mask = _create_block_mask(
-        score_mod, 1, 1, query.shape[-2], key.shape[-2], query.device
+        score_mod,
+        1,
+        1,
+        query.shape[-2],
+        key.shape[-2],
+        query.device,
+        G=query.shape[1] // key.shape[1],
     )
     return block_mask
 
