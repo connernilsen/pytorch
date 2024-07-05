@@ -22,8 +22,15 @@ from torch.distributed.pipelining import (
     ScheduleLoopedBFS,
 )
 from torch.distributed.pipelining.schedules import (
+    _Action,
+    _add_unshard_reshard,
     _format_pipeline_order,
     _validate_pipeline_order,
+    B,
+    F,
+    RESHARD,
+    UNSHARD,
+    W,
 )
 from torch.distributed.pipelining.stage import _PipelineStageBase
 from torch.testing._internal.common_cuda import TEST_MULTIGPU
@@ -681,10 +688,69 @@ class TestSchedulePlan(unittest.TestCase):
 instantiate_parametrized_tests(TestSchedulePlan)
 
 
+class TestScheduleLowering(unittest.TestCase):
+    """Tests lowering passes that convert simple compute-only (FBW) schedules into compute+comms schedules"""
+
+    @parametrize(
+        "action_str_and_ref",
+        [
+            ("1F0", _Action(1, F, 0)),
+            ("2B1", _Action(2, B, 1)),
+            ("0W3", _Action(0, W, 3)),
+            ("1UNSHARD", _Action(1, UNSHARD)),
+            ("3RESHARD", _Action(3, RESHARD)),
+        ],
+    )
+    def test_action_parse(self, action_str_and_ref):
+        act_str, ref = action_str_and_ref
+        act = _Action.from_str(act_str)
+        self.assertEqual(act, ref)
+        self.assertEqual(act_str, act.__repr__())
+
+    @parametrize(
+        "test_info",
+        [
+            {
+                "compute": {
+                    "0": ["0F0", "0F1", "   ", "0B0", "0B1"],
+                    "1": ["   ", "1F0", "1B0", "1B1", "   "],
+                },
+                "comms": {
+                    "0": ["0UNSHARD", "0F0", "0F1", "0B0", "0B1", "0RESHARD"],
+                    "1": ["1UNSHARD", "1F0", "1B0", "1B1", "1RESHARD"],
+                },
+            },
+        ],
+    )
+    def test_unshard_reshard(self, test_info):
+        compute_sch = test_info["compute"]
+        expected_comms_sch = test_info["comms"]
+        for rank in compute_sch:
+            compute_sch[rank] = [_Action.from_str(s) for s in compute_sch[rank]]
+            expected_comms_sch[rank] = [
+                _Action.from_str(s) for s in expected_comms_sch[rank]
+            ]
+
+        comms_sch = _add_unshard_reshard(compute_sch)
+        for rank in expected_comms_sch:
+            for expected, actual in zip(expected_comms_sch[rank], comms_sch[rank]):
+                self.assertEqual(
+                    expected,
+                    actual,
+                    (
+                        f"Mismatch for rank {rank}, expected action {expected} but found {actual}."
+                        f"\nWhole Schedule: {comms_sch}"
+                    ),
+                )
+
+
+instantiate_parametrized_tests(TestScheduleLowering)
+
 if __name__ == "__main__":
     # Run only the TestSchedulePlan tests (single process)
     loader = unittest.TestLoader()
     suite = loader.loadTestsFromTestCase(TestSchedulePlan)
+    suite = loader.loadTestsFromTestCase(TestScheduleLowering)
     runner = unittest.TextTestRunner()
     runner.run(suite)
 
