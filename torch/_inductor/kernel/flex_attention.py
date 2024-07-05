@@ -215,6 +215,7 @@ flex_attention_template = TritonTemplate(
     H = {{size("Q", 1)}}
     Q_LEN = {{size("Q", 2)}}
     KV_LEN = {{size("K", 2)}}
+    Q_LEN_PER_HQ = Q_LEN // GQA_SHARED_HEAD
 
     qk_scale = 1.0
     MATMUL_PRECISION = Q.dtype.element_ty
@@ -284,7 +285,8 @@ flex_attention_template = TritonTemplate(
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = kv_start + tl.arange(0, BLOCK_N)
-    offs_hq = offs_m // (Q_LEN // GQA_SHARED_HEAD) + off_h * GQA_SHARED_HEAD
+    offs_hq = offs_m // Q_LEN_PER_HQ + off_h * GQA_SHARED_HEAD
+    offs_mq = offs_m % Q_LEN_PER_HQ
     # initialize pointer to m and l
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -305,7 +307,7 @@ flex_attention_template = TritonTemplate(
         # -- compute qk ---
         qk = tl.dot(q, k)
         # ~~~~~~~~~~~~~~~~~~~ Apply score modification  ~~~~~~~~~~~~~~~~~~~
-        m = offs_m[:, None]
+        m = offs_mq[:, None]
         n = offs_n[None, :]
         hq = offs_hq[:, None]
         {{ modification(
@@ -541,17 +543,18 @@ def flex_attention(*args, **kwargs):
         device=query.get_device(),
     )
 
-    # In case of GQA, flatten query, output and lse along Hq//Hkv & Mq dimension
-    is_gqa = len(query.get_size()) > 4
-    gqa_shared_heads = 1  # Hq // Hkv
-    if is_gqa:
-        gqa_shared_heads = query.get_size()[2]
-        flattened_q_shape = query.get_size()[:2] + [
-            query.get_size()[-3] * query.get_size()[-2],
-            query.get_size()[-1],
-        ]
-        query = lowerings[aten.reshape](query, flattened_q_shape)
-        logsumexp = lowerings[aten.reshape](logsumexp, flattened_q_shape[:-1])
+    # Reshape GQA dimension: [B, Hq, Mq, D] -> [B, Hkv, Mq * G, D], G=Hq//Hkv
+    gqa_shared_heads = query.get_size()[1] // key.get_size()[1]
+    og_q_shape = query.get_size()
+    flattened_q_shape = [
+        query.get_size()[0],
+        key.get_size()[1],
+        gqa_shared_heads * query.get_size()[-2],
+        query.get_size()[-1],
+    ]
+
+    query = lowerings[aten.reshape](query, flattened_q_shape)
+    logsumexp = lowerings[aten.reshape](logsumexp, flattened_q_shape[:-1])
 
     layout = FixedLayout(
         query.get_device(),
@@ -632,18 +635,15 @@ def flex_attention(*args, **kwargs):
     }
     out = autotune_select_algorithm(
         "flex_attention",
-            choices,
-            inputs_for_autotuning,
-            layout,
-            input_gen_fns=input_gen_fns,
+        choices,
+        inputs_for_autotuning,
+        layout,
+        input_gen_fns=input_gen_fns,
     )
 
-    # In case of gqa, restore flattened Hkv//Hq, Mq shape for logsumexp & out
-    # [B, Hkv, Hq//Hk*Mq, D] -> [B, Hkv, Hq//Hkv, Mq, D]
-    if is_gqa:
-        og_q_shape = out.get_size()[:2] + [gqa_shared_heads, -1, out.get_size()[-1]]
-        logsumexp = lowerings[aten.view](logsumexp, og_q_shape[:-1])
-        out = lowerings[aten.view](out, og_q_shape)
+    # Reshape GQA dimension: [B, Hkv, Mq * G, D] -> [B, Hq, Mq, D], G=Hq//Hkv
+    logsumexp = lowerings[aten.view](logsumexp, og_q_shape[:-1])
+    out = lowerings[aten.view](out, og_q_shape)
 
     return (
         out,
@@ -722,6 +722,7 @@ flex_attention_backward_template = TritonTemplate(
     H = {{size("Q", 1)}}
     Q_LEN = {{size("Q", 2)}}
     KV_LEN = {{size("K", 2)}}
+    Q_LEN_PER_HQ = Q_LEN // GQA_SHARED_HEAD
 
     MATMUL_PRECISION = Q.dtype.element_ty
 
@@ -793,7 +794,8 @@ flex_attention_backward_template = TritonTemplate(
         start_n2 = kv_start
         offs_m2 = start_m2 + tl.arange(0, BLOCK_M2)
         offs_n2 = start_n2 + tl.arange(0, BLOCK_N2)
-        offs_hq2 = offs_m2 // (Q_LEN // GQA_SHARED_HEAD) + off_h * GQA_SHARED_HEAD
+        offs_hq2 = offs_m2 // Q_LEN_PER_HQ + off_h * GQA_SHARED_HEAD
+        offs_mq2 = offs_m2 % Q_LEN_PER_HQ
         kT_ptrs = K + offs_n2[None, :] * stride_km + offs_k[:, None] * stride_kd
         vT_ptrs = V + offs_n2[None, :] * stride_vm + offs_k[:, None] * stride_vd
         Di = tl.load(DELTA + offs_m2)
@@ -809,7 +811,7 @@ flex_attention_backward_template = TritonTemplate(
             qk = tl.dot(q, kT)
             # ~~~~~~~~~~~~~~~~~~~ Apply score modification  ~~~~~~~~~~~~~~~~~~~
             pre_mod_scores = qk
-            m = offs_m2[:, None]
+            m = offs_mq2[:, None]
             n = offs_n2[None, :]
             hq = offs_hq2[:, None]
             {{ modification(
@@ -913,11 +915,12 @@ flex_attention_backward_template = TritonTemplate(
             qT = tl.load(qT_ptrs)
             # Load LSE before computing qk to reduce pipeline stall.
             offs_m1 = curr_m + tl.arange(0, BLOCK_M1)
-            offs_hq1 = offs_m1 // (Q_LEN // GQA_SHARED_HEAD) + off_h * GQA_SHARED_HEAD
+            offs_hq1 = offs_m1 // Q_LEN_PER_HQ + off_h * GQA_SHARED_HEAD
+            offs_mq1 = offs_m1 % Q_LEN_PER_HQ
             lse = tl.load(LSE + offs_m1)
             qkT = tl.dot(k, qT)
             # ~~~~~~~~~~~~~~~~~~~ Apply score modification  ~~~~~~~~~~~~~~~~~~~
-            m = offs_m1[None, :]
+            m = offs_mq1[None, :]
             n = offs_n1[:, None]
             hq = offs_hq1[None, :]
             pre_mod_scores = qkT
@@ -1054,19 +1057,20 @@ def flex_attention_backward(*args, **kwargs):
         key.get_stride(),
     )
 
-    # In case of GQA, flatten out, lse grad_out and query along Hq//Hkv & Mq dimension
-    is_gqa = len(query.get_size()) > 4
-    gqa_shared_heads = 1  # Hq // Hkv
-    if is_gqa:
-        gqa_shared_heads = query.get_size()[2]
-        flattened_q_shape = query.get_size()[:2] + [
-            query.get_size()[-3] * query.get_size()[-2],
-            query.get_size()[-1],
-        ]
-        query = lowerings[aten.reshape](query, flattened_q_shape)
-        logsumexp = lowerings[aten.reshape](logsumexp, flattened_q_shape[:-1])
-        out = lowerings[aten.reshape](out, flattened_q_shape)
-        grad_out = lowerings[aten.reshape](grad_out, flattened_q_shape)
+    # Reshape GQA dimension: [B, Hq, Mq, D] -> [B, Hkv, Mq * G, D], G=Hq//Hkv
+    gqa_shared_heads = query.get_size()[1] // key.get_size()[1]
+    og_q_shape = query.get_size()
+    flattened_q_shape = [
+        query.get_size()[0],
+        key.get_size()[1],
+        gqa_shared_heads * query.get_size()[-2],
+        query.get_size()[-1],
+    ]
+
+    query = lowerings[aten.reshape](query, flattened_q_shape)
+    logsumexp = lowerings[aten.reshape](logsumexp, flattened_q_shape[:-1])
+    out = lowerings[aten.reshape](out, flattened_q_shape)
+    grad_out = lowerings[aten.reshape](grad_out, flattened_q_shape)
 
     # Create delta which will is needed for the bwd's kernel
     mul_delta = lowerings[aten.mul](out, grad_out)
@@ -1166,11 +1170,8 @@ def flex_attention_backward(*args, **kwargs):
         input_gen_fns=input_gen_fns,
     )
 
-    # In case of gqa, restore flattened Hkv//Hq, Mq shape for grad_query
-    # [B, Hkv, Hq//Hk*Mq, D] -> [B, Hkv, Hq//Hkv, Mq, D]
-    if is_gqa:
-        og_q_shape = out.get_size()[:2] + [gqa_shared_heads, -1, out.get_size()[-1]]
-        grad_query = lowerings[aten.view](grad_query, og_q_shape)
+    # Reshape GQA dimension: [B, Hkv, Mq * G, D] -> [B, Hq, Mq, D], G=Hq//Hkv
+    grad_query = lowerings[aten.view](grad_query, og_q_shape)
 
     return (
         grad_query,

@@ -297,7 +297,6 @@ def _create_block_mask(
                             KV_BLOCK_SIZE, Q_BLOCK_SIZE) which represents the block mask.
     """
     mask = _create_mask(score_mod, B, Hkv, M, N, device, G)
-    print("mask", mask.shape)
     block_mask = _create_block_mask_from_mask(mask, KV_BLOCK_SIZE, Q_BLOCK_SIZE)
     return block_mask
 
@@ -319,7 +318,7 @@ def _create_empty_block_mask(query, key, value) -> _BlockMask:
         q_indices=torch.zeros([1, 1, 1, 1], dtype=torch.int32, device=device),
         KV_BLOCK_SIZE=0,
         Q_BLOCK_SIZE=0,
-    ).as_tuple()
+    )
 
 
 def _flex_attention(
@@ -387,6 +386,12 @@ def _flex_attention(
             "NYI: Num of query heads must equal to kv heads. Try setting is_gqa=True for GQA. "
         )
 
+    if is_gqa:
+        Hq = query.size(1)
+        Hkv = key.size(1)
+        if Hq % Hkv != 0:
+            raise ValueError("NYI: Num of query heads must be a multiple of kv heads. ")
+
     # Reshape Query from [B, Hq, L, E] to [B, Hkv, Hq//Hkv, L, E] for GQA inputs
     if block_mask is None:
         block_mask = _create_empty_block_mask(query, key, value)
@@ -396,16 +401,6 @@ def _flex_attention(
         for x in [query, key, value]:
             torch._dynamo.mark_static(x, -1)
             torch._dynamo.mark_static(x, -3)
-        if is_gqa:
-            Hq = query.size(1)
-            Hkv = key.size(1)
-            if Hq % Hkv != 0:
-                raise ValueError(
-                    "NYI: Num of query heads must be a multiple of kv heads. "
-                )
-            query = torch.reshape(
-                query, [query.size(0), Hkv, -1, query.size(-2), query.size(-1)]
-            )
 
         out, _ = flex_attention_hop(
             query,
@@ -415,7 +410,7 @@ def _flex_attention(
             block_mask.as_tuple(),
         )
         # Flatten output from [B, Hkv, Hq//Hkv, L, Ev] to [B, Hq, L, Ev]
-        return out.flatten(start_dim=1, end_dim=2) if is_gqa else out
+        return out
 
     # Some basic input validation
     _validate_sdpa_input(query, key, value)
@@ -424,15 +419,6 @@ def _flex_attention(
 
     if not torch._dynamo.is_dynamo_supported():
         raise RuntimeError("flex_attention requires dynamo support.")
-
-    if is_gqa:
-        Hq = query.size(1)
-        Hkv = key.size(1)
-        if Hq % Hkv != 0:
-            raise ValueError("NYI: Num of query heads must be a multiple of kv heads. ")
-        query = torch.reshape(
-            query, [query.size(0), Hkv, -1, query.size(-2), query.size(-1)]
-        )
 
     with _set_compilation_env():
         with torch._dynamo.utils.disable_cache_limit():
@@ -446,7 +432,7 @@ def _flex_attention(
                     score_mod,
                     block_mask.as_tuple(),
                 )
-                return out.flatten(start_dim=1, end_dim=2) if is_gqa else out
+                return out
 
 
 """Some common used score_mod functions for flex_attention in PyTorch."""
