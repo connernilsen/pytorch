@@ -135,6 +135,20 @@ class WorkerServerTest(TestCase):
             self.assertEqual(resp.status, 200)
             self.assertIn(b"in test_dump_traceback\n", resp.data)
 
+    def test_run_handler(self) -> None:
+        from torch._C._distributed_c10d import _run_handler
+
+        status, content, content_type = _run_handler("ping", b"body", {"foo": "bar"})
+        self.assertEqual(status, 200)
+        self.assertEqual(content, b"pong")
+        self.assertEqual(content_type, "text/plain")
+
+    def test_run_handler_nonexistant(self) -> None:
+        from torch._C._distributed_c10d import _run_handler
+
+        with self.assertRaisesRegex(ValueError, "Failed to find handler nonexistant"):
+            _run_handler("nonexistant", b"", {})
+
 
 if __name__ == "__main__":
     run_tests()

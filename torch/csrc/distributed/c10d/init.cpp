@@ -3199,6 +3199,74 @@ such as `dist.all_reduce(tensor, async_op=True)`.
           py::arg("host_or_file"),
           py::arg("port") = -1)
       .def("shutdown", &::c10d::control_plane::WorkerServer::shutdown);
+
+  module.def(
+      "_run_handler",
+      [](const std::string& name,
+         const std::string& body,
+         const std::unordered_map<std::string, std::string> params)
+          -> std::tuple<int, py::bytes, std::string> {
+        class PythonRequest : public ::c10d::control_plane::Request {
+         public:
+          PythonRequest(
+              const std::string& body,
+              const std::multimap<std::string, std::string>& params)
+              : body_(body), params_(params) {}
+
+          const std::string& body() const override {
+            return body_;
+          }
+
+          const std::multimap<std::string, std::string>& params()
+              const override {
+            return params_;
+          }
+
+         private:
+          const std::string body_;
+          const std::multimap<std::string, std::string> params_;
+        };
+        class PythonResponse : public ::c10d::control_plane::Response {
+         public:
+          void setContent(
+              std::string&& content,
+              const std::string& content_type) override {
+            content_ = std::move(content);
+            content_type_ = content_type;
+          }
+
+          void setStatus(int status) override {
+            status_ = status;
+          }
+
+         public:
+          std::string content_;
+          std::string content_type_;
+          int status_{200};
+        };
+
+        std::multimap paramsMulti{params.cbegin(), params.cend()};
+        PythonRequest request(body, paramsMulti);
+        PythonResponse response;
+        ::c10d::control_plane::getHandler(name)(request, response);
+
+        return {response.status_, response.content_, response.content_type_};
+      },
+      py::arg("name"),
+      py::arg("body"),
+      py::arg("params"),
+      R"(
+        Arguments:
+            name (str): name of the handler to call
+            body (str): body of the request
+            params (Dict[str, str]): parameters of the request
+        Response: Tuple[int, str, str]
+            status code (int)
+            content (bytes)
+            content type (str)
+      )",
+      py::call_guard<py::gil_scoped_release>());
+
   Py_RETURN_TRUE;
 }
 
