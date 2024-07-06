@@ -194,6 +194,8 @@ flex_attention_template = TritonTemplate(
     # SPARSE_KV_NUM_BLKS: The number of unmasked K/V blocks for each query.
     # SPARSE_KV_IDX: The indices of unmasked K/V blocks for each query.
 
+    tl.static_assert(SPARSE_Q_BLOCK_SIZE >= BLOCK_M and SPARSE_Q_BLOCK_SIZE % BLOCK_M == 0)
+    tl.static_assert(SPARSE_KV_BLOCK_SIZE >= BLOCK_N and SPARSE_KV_BLOCK_SIZE % BLOCK_N == 0)
 
     # Define Q Strides
     stride_qz = {{stride("Q", 0)}}
@@ -228,35 +230,25 @@ flex_attention_template = TritonTemplate(
     k_offset = off_z * stride_kz + off_h * stride_kh
     v_offset = off_z * stride_vz + off_h * stride_vh
 
-    use_sparse_mask: tl.constexpr = (not SPARSE_Q_BLOCK_SIZE == 0) and (not SPARSE_KV_BLOCK_SIZE == 0)
-    if use_sparse_mask:
-        tl.static_assert(SPARSE_Q_BLOCK_SIZE >= BLOCK_M and SPARSE_Q_BLOCK_SIZE % BLOCK_M == 0)
-        tl.static_assert(SPARSE_KV_BLOCK_SIZE >= BLOCK_N and SPARSE_KV_BLOCK_SIZE % BLOCK_N == 0)
+    SPARSE_Z = {{size("SPARSE_KV_NUM_BLKS", 0)}}
+    SPARSE_H = {{size("SPARSE_KV_NUM_BLKS", 1)}}
 
+    sparse_idx_z = off_z % SPARSE_Z
+    sparse_idx_h = off_h % SPARSE_H
 
-        SPARSE_Z = {{size("SPARSE_KV_NUM_BLKS", 0)}}
-        SPARSE_H = {{size("SPARSE_KV_NUM_BLKS", 1)}}
+    SPARSE_Q_MULTIPLE: tl.constexpr = (SPARSE_Q_BLOCK_SIZE // BLOCK_M)
+    SPARSE_KV_MULTIPLE: tl.constexpr = (SPARSE_KV_BLOCK_SIZE // BLOCK_N)
 
-        sparse_idx_z = off_z % SPARSE_Z
-        sparse_idx_h = off_h % SPARSE_H
+    SPARSE_Q_BLOCK_CNT: tl.constexpr = Q_LEN // SPARSE_Q_BLOCK_SIZE
+    SPARSE_KV_BLOCK_CNT: tl.constexpr = KV_LEN // SPARSE_KV_BLOCK_SIZE
 
-        SPARSE_Q_MULTIPLE: tl.constexpr = (SPARSE_Q_BLOCK_SIZE // BLOCK_M)
-        SPARSE_KV_MULTIPLE: tl.constexpr = (SPARSE_KV_BLOCK_SIZE // BLOCK_N)
-
-        SPARSE_Q_BLOCK_CNT: tl.constexpr = Q_LEN // SPARSE_Q_BLOCK_SIZE
-        SPARSE_KV_BLOCK_CNT: tl.constexpr = KV_LEN // SPARSE_KV_BLOCK_SIZE
-
-        # SPARSE_KV_IDX and SPARSE_KV_NUM_BLKS are always contiguous.
-        sparse_hz_offset = sparse_idx_z * SPARSE_H + sparse_idx_h
-        sparse_kv_num_blks_offset = sparse_hz_offset * SPARSE_Q_BLOCK_CNT + start_m // SPARSE_Q_MULTIPLE
-        sparse_kv_idx_offset = sparse_hz_offset * SPARSE_Q_BLOCK_CNT * SPARSE_KV_BLOCK_CNT + (start_m // SPARSE_Q_MULTIPLE) * SPARSE_KV_BLOCK_CNT  # noqa: B950
-        kv_indices = SPARSE_KV_IDX + sparse_kv_idx_offset
-        kv_start = tl.load(kv_indices) * SPARSE_KV_BLOCK_SIZE # first kv block we're loading
-        sparse_kv_num_blocks = tl.load(SPARSE_KV_NUM_BLKS + sparse_kv_num_blks_offset)
-        kv_num_n_blocks = sparse_kv_num_blocks * SPARSE_KV_MULTIPLE
-    else:
-        kv_start = 0
-        kv_num_n_blocks = KV_LEN // BLOCK_N
+    # SPARSE_KV_IDX and SPARSE_KV_NUM_BLKS are always contiguous.
+    sparse_hz_offset = sparse_idx_z * SPARSE_H + sparse_idx_h
+    sparse_kv_num_blks_offset = sparse_hz_offset * SPARSE_Q_BLOCK_CNT + start_m // SPARSE_Q_MULTIPLE
+    sparse_kv_idx_offset = sparse_hz_offset * SPARSE_Q_BLOCK_CNT * SPARSE_KV_BLOCK_CNT + (start_m // SPARSE_Q_MULTIPLE) * SPARSE_KV_BLOCK_CNT  # noqa: B950
+    kv_indices = SPARSE_KV_IDX + sparse_kv_idx_offset
+    kv_start = tl.load(kv_indices) * SPARSE_KV_BLOCK_SIZE # first kv block we're loading
+    sparse_kv_num_blocks = tl.load(SPARSE_KV_NUM_BLKS + sparse_kv_num_blks_offset)
 
     Q_block_ptr = tl.make_block_ptr(
         base=Q + q_offset,
@@ -299,7 +291,7 @@ flex_attention_template = TritonTemplate(
 
     # loop over k, v and update accumulator
     lo = 0
-    hi = kv_num_n_blocks
+    hi = sparse_kv_num_blocks * SPARSE_KV_MULTIPLE
 
     for start_n in range(0, hi):
         # -- load k --
@@ -348,17 +340,14 @@ flex_attention_template = TritonTemplate(
         m_i = m_ij
 
         # update pointers
-        if use_sparse_mask:
-            indices_idx = start_n // SPARSE_KV_MULTIPLE
+        indices_idx = start_n // SPARSE_KV_MULTIPLE
 
-            cur_block = tl.load(kv_indices + indices_idx, eviction_policy="evict_last")
-            next_block = tl.load(kv_indices + indices_idx + 1, eviction_policy="evict_last")
-            needs_jump = (start_n + 1) % SPARSE_KV_MULTIPLE == 0
-            jump_to_block = (next_block - cur_block ) * SPARSE_KV_BLOCK_SIZE - (SPARSE_KV_MULTIPLE - 1) * BLOCK_N
+        cur_block = tl.load(kv_indices + indices_idx, eviction_policy="evict_last")
+        next_block = tl.load(kv_indices + indices_idx + 1, eviction_policy="evict_last")
+        needs_jump = (start_n + 1) % SPARSE_KV_MULTIPLE == 0
+        jump_to_block = (next_block - cur_block ) * SPARSE_KV_BLOCK_SIZE - (SPARSE_KV_MULTIPLE - 1) * BLOCK_N
 
-            offset = jump_to_block * needs_jump + (1 - needs_jump) * BLOCK_N
-        else:
-            offset = BLOCK_N
+        offset = jump_to_block * needs_jump + (1 - needs_jump) * BLOCK_N
 
         V_block_ptr = tl.advance(V_block_ptr, (offset, 0))
         K_block_ptr = tl.advance(K_block_ptr, (0, offset))
@@ -579,17 +568,12 @@ def flex_attention(*args, **kwargs):
     # We do need to explicitly pass it in for autotuning though.
 
     for BLOCK_M, BLOCK_N, num_warps, num_stages in configs:
-        if (
-            SPARSE_Q_BLOCK_SIZE != 0 and SPARSE_KV_BLOCK_SIZE % BLOCK_N != 0
-        ):  # if use sparse mask
-            if (
-                SPARSE_KV_BLOCK_SIZE % BLOCK_N != 0
-                or SPARSE_Q_BLOCK_SIZE % BLOCK_M != 0
-            ):  # TODO: find a better way to filter this
-                continue
+        if SPARSE_KV_BLOCK_SIZE % BLOCK_N != 0 or SPARSE_Q_BLOCK_SIZE % BLOCK_M != 0:
+            continue
         # Work around https://github.com/pytorch/pytorch/issues/129625
         if num_stages == 2:
             continue
+
         flex_attention_template.maybe_append_choice(
             choices=choices,
             input_nodes=[
@@ -733,7 +717,6 @@ flex_attention_backward_template = TritonTemplate(
     off_z = off_hz // H # batch idx
     off_h = off_hz % H # head idx
 
-    use_sparse_mask: tl.constexpr = (not SPARSE_Q_BLOCK_SIZE == 0) and (not SPARSE_KV_BLOCK_SIZE == 0)
     SM_Z = {{size("SPARSE_KV_NUM_BLKS", 0)}}
     SM_H = {{size("SPARSE_KV_NUM_BLKS", 1)}}
 
@@ -761,24 +744,19 @@ flex_attention_backward_template = TritonTemplate(
         # THIS BLOCK DOES DQ
         off_pid = pid - NUM_KV_BLOCKS
 
-        if use_sparse_mask:
-            SPARSE_Q_MULTIPLE = (SPARSE_Q_BLOCK_SIZE // BLOCK_M2)
-            SPARSE_KV_MULTIPLE = (SPARSE_KV_BLOCK_SIZE // BLOCK_N2)
+        SPARSE_Q_MULTIPLE = (SPARSE_Q_BLOCK_SIZE // BLOCK_M2)
+        SPARSE_KV_MULTIPLE = (SPARSE_KV_BLOCK_SIZE // BLOCK_N2)
 
-            SPARSE_Q_BLOCK_CNT = Q_LEN // SPARSE_Q_BLOCK_SIZE
-            SPARSE_KV_BLOCK_CNT = KV_LEN // SPARSE_KV_BLOCK_SIZE
+        SPARSE_Q_BLOCK_CNT = Q_LEN // SPARSE_Q_BLOCK_SIZE
+        SPARSE_KV_BLOCK_CNT = KV_LEN // SPARSE_KV_BLOCK_SIZE
 
-            # SPARSE_KV_IDX and SPARSE_KV_NUM_BLKS are always contiguous.
-            sparse_hz_offset = sparse_idx_z * SM_H + sparse_idx_h
-            sparse_kv_num_blks_offset = sparse_hz_offset * SPARSE_Q_BLOCK_CNT + off_pid // SPARSE_Q_MULTIPLE
-            sparse_kv_idx_offset = sparse_hz_offset * SPARSE_Q_BLOCK_CNT * SPARSE_KV_BLOCK_CNT + (off_pid // SPARSE_Q_MULTIPLE) * SPARSE_KV_BLOCK_CNT  # noqa: B950
-            kv_indices = SPARSE_KV_IDX + sparse_kv_idx_offset
-            kv_start = tl.load(kv_indices) * SPARSE_KV_BLOCK_SIZE # first kv block we're loading
-            sparse_kv_num_blocks = tl.load(SPARSE_KV_NUM_BLKS + sparse_kv_num_blks_offset)
-            kv_num_n_blocks = sparse_kv_num_blocks * SPARSE_KV_MULTIPLE
-        else:
-            kv_start = 0
-            kv_num_n_blocks = KV_LEN // BLOCK_N2
+        # SPARSE_KV_IDX and SPARSE_KV_NUM_BLKS are always contiguous.
+        sparse_hz_offset = sparse_idx_z * SM_H + sparse_idx_h
+        sparse_kv_num_blks_offset = sparse_hz_offset * SPARSE_Q_BLOCK_CNT + off_pid // SPARSE_Q_MULTIPLE
+        sparse_kv_idx_offset = sparse_hz_offset * SPARSE_Q_BLOCK_CNT * SPARSE_KV_BLOCK_CNT + (off_pid // SPARSE_Q_MULTIPLE) * SPARSE_KV_BLOCK_CNT  # noqa: B950
+        kv_indices = SPARSE_KV_IDX + sparse_kv_idx_offset
+        kv_start = tl.load(kv_indices) * SPARSE_KV_BLOCK_SIZE # first kv block we're loading
+        sparse_kv_num_blocks = tl.load(SPARSE_KV_NUM_BLKS + sparse_kv_num_blks_offset)
 
         start_m2 = off_pid * BLOCK_M2
 
@@ -803,7 +781,7 @@ flex_attention_backward_template = TritonTemplate(
         tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
 
         curr_n = start_n2
-        hi = kv_num_n_blocks
+        hi = sparse_kv_num_blocks * SPARSE_KV_MULTIPLE
         for start_n in range(0, hi):
             offs_n2= curr_n + tl.arange(0, BLOCK_N2)
             kT = tl.load(kT_ptrs)
@@ -849,15 +827,12 @@ flex_attention_backward_template = TritonTemplate(
             dq += tl.dot(ds, tl.trans(kT))
 
             # Increment pointers.
-            if use_sparse_mask:
-                indices_idx = start_n // SPARSE_KV_MULTIPLE
-                cur_block = tl.load(kv_indices + indices_idx)
-                next_block = tl.load(kv_indices + indices_idx + 1)
-                needs_jump = (start_n + 1) % SPARSE_KV_MULTIPLE == 0
-                jump_to_block = (next_block - cur_block ) * SPARSE_KV_BLOCK_SIZE - (SPARSE_KV_MULTIPLE - 1) * BLOCK_N2
-                offset = jump_to_block * needs_jump + (1 - needs_jump) * BLOCK_N2
-            else:
-                offset = BLOCK_N2
+            indices_idx = start_n // SPARSE_KV_MULTIPLE
+            cur_block = tl.load(kv_indices + indices_idx)
+            next_block = tl.load(kv_indices + indices_idx + 1)
+            needs_jump = (start_n + 1) % SPARSE_KV_MULTIPLE == 0
+            jump_to_block = (next_block - cur_block ) * SPARSE_KV_BLOCK_SIZE - (SPARSE_KV_MULTIPLE - 1) * BLOCK_N2
+            offset = jump_to_block * needs_jump + (1 - needs_jump) * BLOCK_N2
 
             kT_ptrs += offset * stride_km
             vT_ptrs += offset * stride_km
@@ -869,26 +844,20 @@ flex_attention_backward_template = TritonTemplate(
         tl.store(dq_ptrs, dq)
     else:
         # THIS BLOCK DOES DK & DV
-        if use_sparse_mask:
-            SPARSE_Q_MULTIPLE = (SPARSE_Q_BLOCK_SIZE // BLOCK_M1)
-            SPARSE_KV_MULTIPLE = (SPARSE_KV_BLOCK_SIZE // BLOCK_N1)
 
-            SPARSE_Q_BLOCK_CNT = Q_LEN // SPARSE_Q_BLOCK_SIZE
-            SPARSE_KV_BLOCK_CNT = KV_LEN // SPARSE_KV_BLOCK_SIZE
+        SPARSE_Q_MULTIPLE = (SPARSE_Q_BLOCK_SIZE // BLOCK_M1)
+        SPARSE_KV_MULTIPLE = (SPARSE_KV_BLOCK_SIZE // BLOCK_N1)
 
-            # SPARSE_Q_IDX and SPARSE_Q_NUM_BLKS are always contiguous.
-            sparse_hz_offset = sparse_idx_z * SM_H + sparse_idx_h
-            sparse_q_num_blks_offset = sparse_hz_offset * SPARSE_KV_BLOCK_CNT + pid // SPARSE_KV_MULTIPLE
-            sparse_q_idx_offset = sparse_hz_offset * SPARSE_Q_BLOCK_CNT * SPARSE_KV_BLOCK_CNT + (pid // SPARSE_KV_MULTIPLE) * SPARSE_Q_BLOCK_CNT  # noqa: B950
-            q_indices = SPARSE_Q_IDX + sparse_q_idx_offset
-            q_start = tl.load(q_indices) * SPARSE_Q_BLOCK_SIZE # first q block we're loading
-            sparse_q_num_blocks = tl.load(SPARSE_Q_NUM_BLKS + sparse_q_num_blks_offset)
-            q_num_n_blocks = sparse_q_num_blocks * SPARSE_Q_MULTIPLE
-        else:
-            q_start = 0
-            q_num_n_blocks = Q_LEN // BLOCK_M1
+        SPARSE_Q_BLOCK_CNT = Q_LEN // SPARSE_Q_BLOCK_SIZE
+        SPARSE_KV_BLOCK_CNT = KV_LEN // SPARSE_KV_BLOCK_SIZE
 
-
+        # SPARSE_Q_IDX and SPARSE_Q_NUM_BLKS are always contiguous.
+        sparse_hz_offset = sparse_idx_z * SM_H + sparse_idx_h
+        sparse_q_num_blks_offset = sparse_hz_offset * SPARSE_KV_BLOCK_CNT + pid // SPARSE_KV_MULTIPLE
+        sparse_q_idx_offset = sparse_hz_offset * SPARSE_Q_BLOCK_CNT * SPARSE_KV_BLOCK_CNT + (pid // SPARSE_KV_MULTIPLE) * SPARSE_Q_BLOCK_CNT  # noqa: B950
+        q_indices = SPARSE_Q_IDX + sparse_q_idx_offset
+        q_start = tl.load(q_indices) * SPARSE_Q_BLOCK_SIZE # first q block we're loading
+        sparse_q_num_blocks = tl.load(SPARSE_Q_NUM_BLKS + sparse_q_num_blks_offset)
 
         start_n1 = pid * BLOCK_N1
         start_m1 = q_start
@@ -910,7 +879,7 @@ flex_attention_backward_template = TritonTemplate(
         tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
 
         curr_m = start_m1
-        hi = q_num_n_blocks
+        hi = sparse_q_num_blocks * SPARSE_Q_MULTIPLE
         for start_m in range(0, hi):
             qT = tl.load(qT_ptrs)
             # Load LSE before computing qk to reduce pipeline stall.
@@ -961,15 +930,12 @@ flex_attention_backward_template = TritonTemplate(
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             dk += tl.dot(dsT.to(MATMUL_PRECISION), tl.trans(qT))
             # Increment pointers.
-            if use_sparse_mask:
-                indices_idx = start_m // SPARSE_Q_MULTIPLE
-                cur_block = tl.load(q_indices + indices_idx)
-                next_block = tl.load(q_indices + indices_idx + 1)
-                needs_jump = (start_m + 1) % SPARSE_Q_MULTIPLE == 0
-                jump_to_block = (next_block - cur_block ) * SPARSE_Q_BLOCK_SIZE - (SPARSE_Q_MULTIPLE - 1) * BLOCK_M1
-                offset = jump_to_block * needs_jump + (1 - needs_jump) * BLOCK_M1
-            else:
-                offset = BLOCK_M1
+            indices_idx = start_m // SPARSE_Q_MULTIPLE
+            cur_block = tl.load(q_indices + indices_idx)
+            next_block = tl.load(q_indices + indices_idx + 1)
+            needs_jump = (start_m + 1) % SPARSE_Q_MULTIPLE == 0
+            jump_to_block = (next_block - cur_block ) * SPARSE_Q_BLOCK_SIZE - (SPARSE_Q_MULTIPLE - 1) * BLOCK_M1
+            offset = jump_to_block * needs_jump + (1 - needs_jump) * BLOCK_M1
 
             qT_ptrs += offset * stride_qm
             do_ptrs += offset * stride_qm
@@ -1097,14 +1063,13 @@ def flex_attention_backward(*args, **kwargs):
                         configs.append((BLOCK1, BLOCK2, w, s))
 
     for BLOCK1, BLOCK2, num_warps, num_stages in configs:
-        if SPARSE_Q_BLOCK_SIZE != 0 and SPARSE_KV_BLOCK_SIZE != 0:  # if use sparse mask
-            if (
-                SPARSE_KV_BLOCK_SIZE % BLOCK1 != 0
-                or SPARSE_Q_BLOCK_SIZE % BLOCK1 != 0
-                or SPARSE_KV_BLOCK_SIZE % BLOCK2 != 0
-                or SPARSE_Q_BLOCK_SIZE % BLOCK2 != 0
-            ):
-                continue
+        if (
+            SPARSE_KV_BLOCK_SIZE % BLOCK1 != 0
+            or SPARSE_Q_BLOCK_SIZE % BLOCK1 != 0
+            or SPARSE_KV_BLOCK_SIZE % BLOCK2 != 0
+            or SPARSE_Q_BLOCK_SIZE % BLOCK2 != 0
+        ):
+            continue
 
         flex_attention_backward_template.maybe_append_choice(
             choices=choices,

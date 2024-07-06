@@ -309,15 +309,36 @@ def _create_block_mask(
 """
 
 
-def _create_empty_block_mask(query, key, value) -> _BlockMask:
+def _create_empty_block_mask(
+    query,
+    key,
+    value,
+    KV_BLOCK_SIZE: int = _DEFAULT_SPARSE_BLOCK_SIZE,
+    Q_BLOCK_SIZE: int = _DEFAULT_SPARSE_BLOCK_SIZE,
+) -> _BlockMask:
     device = query.device
+    G = query.shape[1] // key.shape[1]
+    Q_NUM_BLOCKS = (query.shape[-2] * G - 1) // Q_BLOCK_SIZE + 1
+    KV_NUM_BLOCKS = (key.shape[-2] - 1) // KV_BLOCK_SIZE + 1
+
+    q_range = torch.arange(Q_NUM_BLOCKS, dtype=torch.int32, device=device)
+    kv_range = torch.arange(KV_NUM_BLOCKS, dtype=torch.int32, device=device)
+
     return _BlockMask(
-        kv_num_blocks=torch.ones([1, 1, 1], dtype=torch.int32, device=device),
-        kv_indices=torch.zeros([1, 1, 1, 1], dtype=torch.int32, device=device),
-        q_num_blocks=torch.ones([1, 1, 1], dtype=torch.int32, device=device),
-        q_indices=torch.zeros([1, 1, 1, 1], dtype=torch.int32, device=device),
-        KV_BLOCK_SIZE=0,
-        Q_BLOCK_SIZE=0,
+        kv_num_blocks=torch.full(
+            [1, 1, Q_NUM_BLOCKS], KV_NUM_BLOCKS, dtype=torch.int32, device=device
+        ),
+        kv_indices=torch.broadcast_to(
+            kv_range[None, None, None, :], [1, 1, Q_NUM_BLOCKS, KV_NUM_BLOCKS]
+        ),
+        q_num_blocks=torch.full(
+            [1, 1, KV_NUM_BLOCKS], Q_NUM_BLOCKS, dtype=torch.int32, device=device
+        ),
+        q_indices=torch.broadcast_to(
+            q_range[None, None, None, :], [1, 1, KV_NUM_BLOCKS, Q_NUM_BLOCKS]
+        ),
+        KV_BLOCK_SIZE=KV_BLOCK_SIZE,
+        Q_BLOCK_SIZE=Q_BLOCK_SIZE,
     )
 
 
