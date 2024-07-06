@@ -465,7 +465,7 @@ class TestFlexAttention(InductorTestCase):
             dtype,
             B,
             H * 4,  # Hq = 4*Hkv.
-            S,
+            S // 8,
             D,
             B,
             H,
