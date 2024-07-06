@@ -203,14 +203,9 @@ def _convert_block_mask_to_mask(
     return block_mask
 
 
-def _create_block_mask_from_mask(
-    mask: torch.Tensor,
-    KV_BLOCK_SIZE: int = _DEFAULT_SPARSE_BLOCK_SIZE,
-    Q_BLOCK_SIZE: int = _DEFAULT_SPARSE_BLOCK_SIZE,
+def _create_block_mask_from_dense(
+    block_mask, device, KV_BLOCK_SIZE, Q_BLOCK_SIZE
 ) -> _BlockMask:
-    block_mask = _convert_mask_to_block_mask(
-        mask, KV_BLOCK_SIZE=KV_BLOCK_SIZE, Q_BLOCK_SIZE=Q_BLOCK_SIZE
-    )
     block_mask = block_mask.to(dtype=torch.int8)
     kv_num_blocks = block_mask.sum(dim=3)
     kv_indices = torch.argsort(block_mask, dim=3, descending=True, stable=True)
@@ -219,38 +214,80 @@ def _create_block_mask_from_mask(
         0, 1, 3, 2
     )
     return _BlockMask(
-        kv_num_blocks=kv_num_blocks.to(torch.int32).to(mask.device).contiguous(),
-        kv_indices=kv_indices.to(torch.int32).to(mask.device).contiguous(),
-        q_num_blocks=q_num_blocks.to(torch.int32).to(mask.device).contiguous(),
-        q_indices=q_indices.to(torch.int32).to(mask.device).contiguous(),
+        kv_num_blocks=kv_num_blocks.to(torch.int32).to(device).contiguous(),
+        kv_indices=kv_indices.to(torch.int32).to(device).contiguous(),
+        q_num_blocks=q_num_blocks.to(torch.int32).to(device).contiguous(),
+        q_indices=q_indices.to(torch.int32).to(device).contiguous(),
         KV_BLOCK_SIZE=KV_BLOCK_SIZE,
         Q_BLOCK_SIZE=Q_BLOCK_SIZE,
     )
 
 
+def _create_block_mask_from_mask(
+    mask: torch.Tensor,
+    KV_BLOCK_SIZE: int = _DEFAULT_SPARSE_BLOCK_SIZE,
+    Q_BLOCK_SIZE: int = _DEFAULT_SPARSE_BLOCK_SIZE,
+) -> _BlockMask:
+    block_mask = _convert_mask_to_block_mask(
+        mask, KV_BLOCK_SIZE=KV_BLOCK_SIZE, Q_BLOCK_SIZE=Q_BLOCK_SIZE
+    )
+    return _create_block_mask_from_dense(
+        block_mask, mask.device, KV_BLOCK_SIZE, Q_BLOCK_SIZE
+    )
+
+
+def _broadcast_block_mask_for_gqa(block_mask, q, k, v) -> _BlockMask:
+    B, Hq, Mq, _ = q.shape
+    _, Hkv, Mkv, _ = k.shape
+    _, _, Q_NUM_BLOCKS, KV_NUM_BLOCKS = block_mask.kv_indices.shape
+    if (Hq // Hkv) * Mq == Q_NUM_BLOCKS * block_mask.Q_BLOCK_SIZE:
+        return block_mask
+
+    G = Hq // Hkv
+    dense_mask = block_mask.to_dense()
+    dense_mask = dense_mask.repeat(1, 1, G, 1)
+    return _create_block_mask_from_dense(
+        dense_mask,
+        block_mask.kv_indices.device,
+        block_mask.Q_BLOCK_SIZE,
+        block_mask.KV_BLOCK_SIZE,
+    )
+
+
 def _create_mask(
     score_mod: _score_mod_signature,
-    B: int,
-    Hkv: int,
+    B: Optional[int],
+    Hkv: Optional[int],
+    Hq: Optional[int],
     M: int,
     N: int,
     device: str = "cuda",
-    G: int = 1,
 ):
     r"""This function creates a mask tensor from a score_mod function.
+        B, Hq, Hkv can be set to None to broadcast the mask along B & H dim.
 
     Args:
         score_mod (Callable): Function to modify attention scores.
         B (int): Batch size.
-        Hkv (int): Number of KV heads.
+        Hkv (int): Number of key/value heads.
+        Hq(int): Number of query heads.
         M (int): Sequence length of query.
         N (int): Sequence length of key/value.
         device (str): Device to run the mask creation on.
-        G (int): Hq // Hkv. In case of GQA, the number of query heads that share the same kv head.
 
     Returns:
         mask (Tensor): A mask tensor with shape (B, Hkv, M * G, N).
     """
+    if B is None:
+        B = 1
+    if Hq is None and Hkv is None:
+        Hq = 1
+        Hkv = 1
+    if Hq is None or Hkv is None:
+        raise ValueError("Hq and Hkv must be both None or both specified. ")
+
+    G = Hq // Hkv
+    assert Hq % Hkv == 0
     b = torch.arange(0, B, device=device)
     hkv = torch.arange(0, Hkv, device=device)
     g = torch.arange(0, G, device=device)
@@ -270,33 +307,34 @@ def _create_mask(
 
 def _create_block_mask(
     score_mod: _score_mod_signature,
-    B: int,
-    Hkv: int,
+    B: Optional[int],
+    Hkv: Optional[int],
+    Hq: Optional[int],
     M: int,
     N: int,
     device: str = "cuda",
     KV_BLOCK_SIZE: int = _DEFAULT_SPARSE_BLOCK_SIZE,
     Q_BLOCK_SIZE: int = _DEFAULT_SPARSE_BLOCK_SIZE,
-    G: int = 1,
 ):
     r"""This function creates a block mask tuple from a score_mod function.
+        B, Hq, Hkv can be set to None to broadcast the mask along B & H dim.
 
     Args:
         score_mod (Callable): Function to modify attention scores.
         B (int): Batch size.
         Hkv (int): Number of KV heads.
+        Hq (int): Number of query heads.
         M (int): Sequence length of query.
         N (int): Sequence length of key/value.
         device (str): Device to run the mask creation on.
         KV_BLOCK_SIZE (int): Block size of block mask for each query.
         Q_BLOCK_SIZE (int): Block size of block mask for each key/value.
-        G (int): In case of GQA, the number of query heads that share the same kv head.
 
     Returns:
         block_mask (tuple): A tuple of (kv_num_blocks, kv_indices, q_num_blocks, q_indices,
                             KV_BLOCK_SIZE, Q_BLOCK_SIZE) which represents the block mask.
     """
-    mask = _create_mask(score_mod, B, Hkv, M, N, device, G)
+    mask = _create_mask(score_mod, B, Hkv, Hq, M, N, device)
     block_mask = _create_block_mask_from_mask(mask, KV_BLOCK_SIZE, Q_BLOCK_SIZE)
     return block_mask
 
@@ -317,8 +355,7 @@ def _create_empty_block_mask(
     Q_BLOCK_SIZE: int = _DEFAULT_SPARSE_BLOCK_SIZE,
 ) -> _BlockMask:
     device = query.device
-    G = query.shape[1] // key.shape[1]
-    Q_NUM_BLOCKS = (query.shape[-2] * G - 1) // Q_BLOCK_SIZE + 1
+    Q_NUM_BLOCKS = (query.shape[-2] - 1) // Q_BLOCK_SIZE + 1
     KV_NUM_BLOCKS = (key.shape[-2] - 1) // KV_BLOCK_SIZE + 1
 
     q_range = torch.arange(Q_NUM_BLOCKS, dtype=torch.int32, device=device)
@@ -413,9 +450,11 @@ def _flex_attention(
         if Hq % Hkv != 0:
             raise ValueError("NYI: Num of query heads must be a multiple of kv heads. ")
 
-    # Reshape Query from [B, Hq, L, E] to [B, Hkv, Hq//Hkv, L, E] for GQA inputs
     if block_mask is None:
         block_mask = _create_empty_block_mask(query, key, value)
+
+    if is_gqa:
+        block_mask = _broadcast_block_mask_for_gqa(block_mask, query, key, value)
 
     if torch.compiler.is_dynamo_compiling():
         # mark head_dim & num of heads always to be static
@@ -430,7 +469,6 @@ def _flex_attention(
             score_mod,
             block_mask.as_tuple(),
         )
-        # Flatten output from [B, Hkv, Hq//Hkv, L, Ev] to [B, Hq, L, Ev]
         return out
 
     # Some basic input validation

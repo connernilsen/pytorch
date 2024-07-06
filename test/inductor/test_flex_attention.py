@@ -57,12 +57,12 @@ def create_attention(score_mod, block_mask, is_gqa):
 def create_block_mask(score_mod, query, key):
     block_mask = _create_block_mask(
         score_mod,
-        1,
-        1,
+        None,
+        None,
+        None,
         query.shape[-2],
         key.shape[-2],
         query.device,
-        G=query.shape[1] // key.shape[1],
     )
     return block_mask
 
@@ -1258,7 +1258,7 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
         def causal(score, b, h, q, kv):
             return torch.where(q >= kv, score, -float("inf"))
 
-        block_mask = _create_block_mask(causal, 1, 1, 2048, 2048)
+        block_mask = _create_block_mask(causal, None, None, None, 2048, 2048)
 
         def replace_non_printable(s):
             def replace(c):
