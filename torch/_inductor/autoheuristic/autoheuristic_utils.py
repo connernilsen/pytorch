@@ -241,3 +241,8 @@ def get_dims_need_padding_ops() -> List[AHOperation]:
 
     num_dims_op = AHOperation("num_dims_needs_padding", num_dims_needs_padding_fn)
     return [mat1_innermost_op, mat2_innermost_op, num_dims_op]
+
+
+def context_add_strides(context: AHContext, name: str, stride: Tuple[int, ...]) -> None:
+    for i, s in enumerate(stride):
+        context.add_feature(f"{name}_stride_{i}", s)
