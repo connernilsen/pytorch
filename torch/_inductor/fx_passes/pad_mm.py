@@ -500,7 +500,7 @@ def should_pad_bench(
 
         pad_time = None
         if (
-            torch._inductor.config.autoheuristic_mode != "OFF"
+            torch._inductor.config.run_autoheuristic("pad_mm")
             and op is torch.ops.aten.mm
         ):
             (ah_should_pad, ah_ori_time, ah_pad_time) = run_autoheuristic(
